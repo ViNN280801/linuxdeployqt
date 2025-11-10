@@ -1,0 +1,4 @@
+ansi2html
+colorlog
+PyQt5
+PyQt5_sip
