@@ -200,8 +200,11 @@ class QtDeployer:
                 return False
 
             # Deploy system Qt libraries with version aliasing if Qt detected
+            # Only deploy Qt libraries that are actually used by the application
             if self.qt_detected > 0:
-                if not self._deploy_system_qt_libraries(target_dir, self.qt_detected):
+                if not self._deploy_system_qt_libraries(
+                    executable_path, target_dir, self.qt_detected
+                ):
                     self.logger.warning(
                         "Failed to deploy system Qt libraries, but continuing..."
                     )
@@ -495,6 +498,10 @@ class QtDeployer:
                         f"🔧 Adding missing Qt platform library: {missing_lib.library_name}"
                     )
 
+            # Track original application dependencies to avoid pulling in unnecessary Qt modules
+            original_deps = set(libraries_to_bundle)
+            original_dep_names = {os_path_basename(dep) for dep in original_deps}
+
             # Deploy each library
             copied_libraries = []
             processed_paths = set()
@@ -519,12 +526,59 @@ class QtDeployer:
                     self._run_strip(deployed_path)
 
                 # Check for dependencies of this library (recursive)
-                # Use get_libs to respect exclude list
+                # BUT: Limit recursive dependency collection for Qt libraries to prevent
+                # pulling in unnecessary Qt modules (QML, Quick, WebEngine, etc.)
+                # that are not directly used by the application
                 if deployed_path not in processed_paths:
                     processed_paths.add(deployed_path)
-                    dep_library_paths = self.dependency_collector.get_libs(
-                        deployed_path
+
+                    # Check if this is a Qt library that wasn't in original dependencies
+                    lib_name = os_path_basename(deployed_path)
+                    is_qt_lib = lib_name.startswith(("libQt5", "libQt6", "libQt"))
+                    is_original_dep = lib_name in original_dep_names or any(
+                        os_path_basename(orig) == lib_name for orig in original_deps
                     )
+
+                    # For Qt libraries not in original deps, only collect non-Qt dependencies
+                    # This prevents pulling in QML/Quick/WebEngine when they're not needed
+                    if is_qt_lib and not is_original_dep:
+                        self.logger.debug(
+                            f"⚠️ Limiting dependency collection for Qt library {lib_name} "
+                            f"(not in original app dependencies)"
+                        )
+                        # Only collect non-Qt dependencies to avoid pulling in Qt modules
+                        dep_library_paths = self.dependency_collector.get_libs(
+                            deployed_path
+                        )
+                        # Filter out Qt libraries that weren't in original dependencies
+                        filtered_deps = []
+                        for dep_lib_path in dep_library_paths:
+                            dep_lib_name = os_path_basename(dep_lib_path)
+                            dep_base_name = dep_lib_name.split(".")[0]
+
+                            # Allow non-Qt libraries
+                            if not dep_lib_name.startswith(
+                                ("libQt5", "libQt6", "libQt")
+                            ):
+                                filtered_deps.append(dep_lib_path)
+                            # Allow Qt libraries that were in original dependencies
+                            elif dep_lib_name in original_dep_names or any(
+                                os_path_basename(orig).split(".")[0] == dep_base_name
+                                for orig in original_deps
+                            ):
+                                filtered_deps.append(dep_lib_path)
+                            else:
+                                self.logger.debug(
+                                    f"⏭️  Skipping Qt dependency {dep_lib_name} "
+                                    f"(not in original app dependencies)"
+                                )
+
+                        dep_library_paths = filtered_deps
+                    else:
+                        # For non-Qt libraries or original Qt dependencies, collect all deps
+                        dep_library_paths = self.dependency_collector.get_libs(
+                            deployed_path
+                        )
 
                     for dep_lib_path in dep_library_paths:
                         dep_lib_name = os_path_basename(dep_lib_path)
@@ -1975,13 +2029,16 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
         except Exception:
             pass
 
-    def _deploy_system_qt_libraries(self, target_dir: str, qt_version: int) -> bool:
+    def _deploy_system_qt_libraries(
+        self, executable_path: str, target_dir: str, qt_version: int
+    ) -> bool:
         """
-        Deploy all Qt libraries from system directories or explicit Qt path with proper version aliasing.
-        This ensures that all Qt libraries of the detected version are available in AppDir,
-        preventing version conflicts when loading plugins.
+        Deploy only Qt libraries that are actually used by the application.
+        This prevents bundling unnecessary Qt modules (QML, Quick, WebEngine, etc.)
+        when the application doesn't use them.
 
         Args:
+            executable_path: Path to the application binary
             target_dir: Target AppDir path
             qt_version: Detected Qt version (4, 5, or 6)
 
@@ -1991,13 +2048,49 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
         if not self.appdir_paths or qt_version == 0:
             return False
 
+        self.logger.info(
+            f"🔧 Deploying only used Qt{qt_version} libraries (not all Qt libraries)..."
+        )
+
+        # Get actual Qt libraries used by the application
+        # This includes libraries found via ldd and their direct dependencies
+        used_qt_libraries = set()
+
+        # Get all libraries that are actually used (from _deploy_all_libraries)
+        all_used_libs = self.dependency_collector.get_libs(executable_path)
+
+        # Extract Qt library names from used libraries
+        for lib_path in all_used_libs:
+            lib_name = os_path_basename(lib_path)
+            # Check if it's a Qt library
+            if qt_version == 5 and lib_name.startswith("libQt5"):
+                # Extract base name (e.g., "libQt5Core.so.5" -> "libQt5Core")
+                base_name = lib_name.split(".")[0]
+                used_qt_libraries.add(base_name)
+            elif qt_version == 6 and lib_name.startswith("libQt6"):
+                base_name = lib_name.split(".")[0]
+                used_qt_libraries.add(base_name)
+            elif (
+                qt_version == 4
+                and lib_name.startswith("libQt")
+                and not lib_name.startswith(("libQt5", "libQt6"))
+            ):
+                base_name = lib_name.split(".")[0]
+                used_qt_libraries.add(base_name)
+
+        if not used_qt_libraries:
+            self.logger.warning("No Qt libraries found in application dependencies")
+            return True  # Not an error, just no Qt libraries to deploy
+
+        self.logger.info(
+            f"📋 Found {len(used_qt_libraries)} Qt libraries used by application: {sorted(used_qt_libraries)}"
+        )
+
         # Use explicit Qt path if set, otherwise use system paths
         if self.explicit_qt_path:
             explicit_lib_path = os_join(self.explicit_qt_path, "lib")
             if os_path_exists(explicit_lib_path):
-                self.logger.info(
-                    f"🎯 Deploying Qt{qt_version} libraries from explicit path: {explicit_lib_path}"
-                )
+                self.logger.info(f"🎯 Using explicit Qt path: {explicit_lib_path}")
                 system_lib_paths = [explicit_lib_path]
             else:
                 self.logger.warning(
@@ -2005,9 +2098,6 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                 )
                 return False
         else:
-            self.logger.info(
-                f"🔧 Deploying all Qt{qt_version} libraries from system..."
-            )
             # System library search paths
             system_lib_paths = [
                 "/usr/lib/x86_64-linux-gnu",
@@ -2018,27 +2108,16 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                 "/lib64",
             ]
 
-        # Qt library pattern based on version
-        if qt_version == 5:
-            lib_pattern = "libQt5*.so*"
-        elif qt_version == 6:
-            lib_pattern = "libQt6*.so*"
-        elif qt_version == 4:
-            lib_pattern = "libQt*.so*"  # noqa: F841
-        else:
-            self.logger.warning(f"Unsupported Qt version: {qt_version}")
-            return False
-
         deployed_count = 0
         skipped_count = 0
 
+        # Only deploy Qt libraries that are actually used
         for search_path in system_lib_paths:
             if not os_path_exists(search_path):
                 continue
 
             try:
-                # Find all Qt libraries in this directory
-                qt_libraries = []
+                # Find Qt libraries in this directory
                 for file in os_listdir(search_path):
                     file_path = os_join(search_path, file)
 
@@ -2046,24 +2125,30 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                     if not os_path_isfile(file_path):
                         continue
 
+                    lib_name = os_path_basename(file_path)
+                    base_name = lib_name.split(".")[0]
+
+                    # Check if this library is actually used
+                    if base_name not in used_qt_libraries:
+                        continue
+
                     # Check if it matches Qt pattern for this version
                     if qt_version == 5 and file.startswith("libQt5") and ".so" in file:
-                        qt_libraries.append(file_path)
+                        pass  # Valid Qt5 library
                     elif (
                         qt_version == 6 and file.startswith("libQt6") and ".so" in file
                     ):
-                        qt_libraries.append(file_path)
+                        pass  # Valid Qt6 library
                     elif (
                         qt_version == 4
                         and file.startswith("libQt")
                         and not file.startswith(("libQt5", "libQt6"))
                         and ".so" in file
                     ):
-                        qt_libraries.append(file_path)
+                        pass  # Valid Qt4 library
+                    else:
+                        continue
 
-                # Process found libraries
-                for lib_path in qt_libraries:
-                    lib_name = os_path_basename(lib_path)
                     target_lib_path = os_join(self.appdir_paths.LIB_DIR, lib_name)
 
                     # Skip if already deployed
@@ -2072,7 +2157,7 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                         continue
 
                     # Skip symlinks - only deploy actual files
-                    if os_path_islink(lib_path):
+                    if os_path_islink(file_path):
                         continue
 
                     # Skip static libraries (.a files) and development files (.prl)
@@ -2082,7 +2167,7 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                     try:
                         # Copy library to AppDir
                         os_makedirs(os_path_dirname(target_lib_path), exist_ok=True)
-                        shutil_copy2(lib_path, target_lib_path)
+                        shutil_copy2(file_path, target_lib_path)
 
                         # Create version aliases
                         self._create_library_version_aliases(
@@ -2093,7 +2178,7 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                         self._change_identification(target_lib_path)
 
                         deployed_count += 1
-                        self.logger.debug(f"✅ Deployed Qt library: {lib_name}")
+                        self.logger.debug(f"✅ Deployed used Qt library: {lib_name}")
 
                     except Exception as e:
                         self.logger.debug(f"Failed to deploy {lib_name}: {e}")
@@ -2102,7 +2187,7 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                 self.logger.debug(f"Error scanning {search_path}: {e}")
 
         self.logger.info(
-            f"📦 Deployed {deployed_count} Qt{qt_version} libraries, skipped {skipped_count} existing"
+            f"📦 Deployed {deployed_count} used Qt{qt_version} libraries, skipped {skipped_count} existing"
         )
         return deployed_count > 0
 
