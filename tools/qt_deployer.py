@@ -2228,8 +2228,49 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                             target_lib_path, self.appdir_paths.LIB_DIR
                         )
 
-                        # Fix RPATH
+                        # Fix RPATH - CRITICAL: Remove any absolute paths from build-time RPATH
+                        # This ensures libraries use $ORIGIN instead of build paths
                         self._change_identification(target_lib_path)
+                        
+                        # Additional RPATH fix to ensure no absolute paths remain
+                        try:
+                            result = subprocess_run(
+                                ["patchelf", "--print-rpath", target_lib_path],
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                                timeout=5,
+                            )
+                            if result.returncode == 0:
+                                current_rpath = result.stdout.strip()
+                                # Check if RPATH contains absolute paths (build paths)
+                                if current_rpath and any(
+                                    path.startswith("/") and not path.startswith("$ORIGIN")
+                                    for path in current_rpath.split(":")
+                                ):
+                                    self.logger.warning(
+                                        f"⚠️ Found absolute RPATH in Qt library {lib_name}: {current_rpath}"
+                                    )
+                                    # Force remove and set relative RPATH
+                                    subprocess_run(
+                                        ["patchelf", "--remove-rpath", target_lib_path],
+                                        capture_output=True,
+                                        text=True,
+                                        check=False,
+                                        timeout=5,
+                                    )
+                                    subprocess_run(
+                                        ["patchelf", "--force-rpath", "--set-rpath", "$ORIGIN:$ORIGIN/../lib", target_lib_path],
+                                        capture_output=True,
+                                        text=True,
+                                        check=True,
+                                        timeout=5,
+                                    )
+                                    self.logger.info(
+                                        f"✅ Fixed RPATH for Qt library {lib_name}"
+                                    )
+                        except Exception as e:
+                            self.logger.debug(f"Could not verify/fix RPATH for {lib_name}: {e}")
 
                         deployed_count += 1
                         self.logger.debug(f"✅ Deployed used Qt library: {lib_name}")
