@@ -798,10 +798,17 @@ class QtDeployer:
                 lib_info.deployed_install_name = "$ORIGIN"
 
                 missing_libraries.append(lib_info)
+                self.logger.info(
+                    f"🔧 Adding critical Qt{self.qt_detected} platform library: {lib_name}"
+                )
+            else:
                 self.logger.debug(
-                    f"Found critical Qt{self.qt_detected} library: {lib_path}"
+                    f"Critical Qt library not found: {lib_path}"
                 )
 
+        if missing_libraries:
+            self.logger.info(f"Found {len(missing_libraries)} critical Qt platform libraries to bundle")
+        
         return missing_libraries
 
     def _create_enhanced_apprun_script(self, app_name: str, fhs_like_mode: bool) -> str:
@@ -1036,6 +1043,55 @@ exec "$EXEC" "$@"
         except Exception as e:
             self.logger.error(f"Failed to copy library {library.library_name}: {e}")
             return None
+
+    def _fix_plugin_dt_needed(self, plugin_path: str):
+        """
+        Fix DT_NEEDED entries in plugins to replace absolute Qt library paths.
+        This is critical for plugins (especially libqxcb.so) that may have
+        absolute paths to Qt libraries like /usr/lib/x86_64-linux-gnu/libQt5XcbQpa.so.5
+        """
+        try:
+            result = subprocess_run(
+                ["readelf", "-d", plugin_path],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                fixed_count = 0
+                for line in result.stdout.split("\n"):
+                    if "NEEDED" in line and "[" in line and "]" in line:
+                        try:
+                            needed_lib = line.split("[")[1].split("]")[0]
+                            # Check if it's an absolute path (starts with /)
+                            if needed_lib.startswith("/"):
+                                lib_name = os_path_basename(needed_lib)
+                                self.logger.warning(
+                                    f"⚠️ Plugin {os_path_basename(plugin_path)} has absolute path: {needed_lib}"
+                                )
+                                # Replace with just the library name
+                                replace_result = subprocess_run(
+                                    ["patchelf", "--replace-needed", needed_lib, lib_name, plugin_path],
+                                    capture_output=True,
+                                    text=True,
+                                    check=True,
+                                    timeout=5,
+                                )
+                                self.logger.info(
+                                    f"✅ Replaced {needed_lib} with {lib_name} in {os_path_basename(plugin_path)}"
+                                )
+                                fixed_count += 1
+                        except Exception as e:
+                            self.logger.debug(f"Could not process NEEDED entry: {e}")
+                            continue
+                
+                if fixed_count > 0:
+                    self.logger.info(f"Fixed {fixed_count} absolute path(s) in {os_path_basename(plugin_path)}")
+        except (FileNotFoundError, subprocess_CalledProcessError) as e:
+            self.logger.debug(f"readelf not available or failed for {os_path_basename(plugin_path)}: {e}")
+        except Exception as e:
+            self.logger.debug(f"Error fixing DT_NEEDED for {os_path_basename(plugin_path)}: {e}")
 
     def _change_identification(self, binary_path: str):
         """Change RPATH identification with improved isolation for all libraries (Qt and non-Qt)"""
@@ -1288,6 +1344,8 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                         os_makedirs(os_path_dirname(plugin_target), exist_ok=True)
                         shutil_copy2(plugin_source, plugin_target)
                         os_chmod(plugin_target, 0o755)
+                        # CRITICAL: Fix DT_NEEDED for plugins - replace absolute Qt library paths
+                        self._fix_plugin_dt_needed(plugin_target)
                         # CRITICAL: Fix RPATH for plugins to use AppDir libraries
                         self._change_identification(plugin_target)
                         if self.run_strip_enabled:
@@ -1306,6 +1364,8 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                                 if file.endswith(".so"):
                                     so_path = os_join(root, file)
                                     os_chmod(so_path, 0o755)
+                                    # CRITICAL: Fix DT_NEEDED for plugins - replace absolute Qt library paths
+                                    self._fix_plugin_dt_needed(so_path)
                                     # CRITICAL: Fix RPATH for plugins to use AppDir libraries
                                     self._change_identification(so_path)
                                     if self.run_strip_enabled:
