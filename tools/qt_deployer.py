@@ -1932,8 +1932,62 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                     f"Found {len(problematic_files)} files with problematic RPATH settings"
                 )
                 for file_path in problematic_files:
-                    # self._change_identification(file_path) # Removed this line as per requirement
-                    pass  # Do nothing, as RPATH for libraries should not be touched
+                    # Fix RPATH for libraries with absolute paths
+                    try:
+                        # Calculate appropriate RPATH based on file location
+                        file_dir = os_path_dirname(file_path)
+                        lib_dir = self.appdir_paths.LIB_DIR
+
+                        # Determine relative path to lib directory
+                        try:
+                            rel_path = os_path_relpath(lib_dir, file_dir)
+                            if rel_path.startswith(".."):
+                                # File is in root or subdirectory, use standard paths
+                                if file_path.endswith(
+                                    ".so"
+                                ) or ".so." in os_path_basename(file_path):
+                                    # Shared library - use relative paths
+                                    new_rpath = "$ORIGIN:$ORIGIN/../lib"
+                                else:
+                                    # Executable
+                                    new_rpath = "$ORIGIN:$ORIGIN/../lib"
+                            else:
+                                # File is already in lib directory or subdirectory
+                                new_rpath = "$ORIGIN:$ORIGIN/../lib"
+                        except ValueError:
+                            # Fallback if relative path calculation fails
+                            new_rpath = "$ORIGIN:$ORIGIN/../lib"
+
+                        # Remove existing RPATH and set new one
+                        subprocess_run(
+                            ["patchelf", "--remove-rpath", file_path],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=10,
+                        )
+
+                        subprocess_run(
+                            [
+                                "patchelf",
+                                "--force-rpath",
+                                "--set-rpath",
+                                new_rpath,
+                                file_path,
+                            ],
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                            timeout=10,
+                        )
+
+                        self.logger.info(
+                            f"✅ Fixed RPATH for {os_path_relpath(file_path, target_dir)}: {new_rpath}"
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            f"⚠️ Could not fix RPATH for {os_path_relpath(file_path, target_dir)}: {e}"
+                        )
 
                 # Verify again
                 still_problematic = 0
