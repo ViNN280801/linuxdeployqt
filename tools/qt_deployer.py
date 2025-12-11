@@ -1288,7 +1288,8 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                         os_makedirs(os_path_dirname(plugin_target), exist_ok=True)
                         shutil_copy2(plugin_source, plugin_target)
                         os_chmod(plugin_target, 0o755)
-                        # self._change_identification(plugin_target)
+                        # CRITICAL: Fix RPATH for plugins to use AppDir libraries
+                        self._change_identification(plugin_target)
                         if self.run_strip_enabled:
                             self._run_strip(plugin_target)
                     elif os_path_isdir(plugin_source):
@@ -1305,7 +1306,8 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                                 if file.endswith(".so"):
                                     so_path = os_join(root, file)
                                     os_chmod(so_path, 0o755)
-                                    # self._change_identification(so_path)
+                                    # CRITICAL: Fix RPATH for plugins to use AppDir libraries
+                                    self._change_identification(so_path)
                                     if self.run_strip_enabled:
                                         self._run_strip(so_path)
 
@@ -1879,6 +1881,7 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                         continue
 
                     # Check if file is executable or shared library
+                    # Include plugins (they are .so files in plugins/ subdirectories)
                     if (
                         file.endswith(".so")
                         or ".so." in file
@@ -1957,6 +1960,42 @@ Qml2Imports = {self.appdir_paths.QT_CONF_QML}
                         except ValueError:
                             # Fallback if relative path calculation fails
                             new_rpath = "$ORIGIN:$ORIGIN/../lib"
+
+                        # Check DT_NEEDED entries for absolute paths to Qt libraries
+                        # This is critical for plugins that may reference system Qt libraries
+                        try:
+                            result = subprocess_run(
+                                ["readelf", "-d", file_path],
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                                timeout=5,
+                            )
+                            if result.returncode == 0:
+                                for line in result.stdout.split("\n"):
+                                    if "NEEDED" in line and "[" in line:
+                                        needed_lib = line.split("[")[1].split("]")[0]
+                                        # Check if it's an absolute path to Qt library
+                                        if needed_lib.startswith("/") and "Qt" in needed_lib:
+                                            lib_name = os_path_basename(needed_lib)
+                                            self.logger.warning(
+                                                f"⚠️ Found absolute Qt library path in {os_path_basename(file_path)}: {needed_lib}"
+                                            )
+                                            # Replace with relative library name
+                                            subprocess_run(
+                                                ["patchelf", "--replace-needed", needed_lib, lib_name, file_path],
+                                                capture_output=True,
+                                                text=True,
+                                                check=True,
+                                                timeout=5,
+                                            )
+                                            self.logger.info(
+                                                f"✅ Replaced absolute path with relative name: {lib_name}"
+                                            )
+                        except (FileNotFoundError, subprocess_CalledProcessError) as e:
+                            self.logger.debug(f"Could not check DT_NEEDED for {os_path_basename(file_path)}: {e}")
+                        except Exception as e:
+                            self.logger.debug(f"Error checking DT_NEEDED for {os_path_basename(file_path)}: {e}")
 
                         # Remove existing RPATH and set new one
                         subprocess_run(
